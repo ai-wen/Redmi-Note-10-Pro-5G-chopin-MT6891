@@ -327,8 +327,22 @@ jobs:
           CHROOT_EOF
 
           # --- 清理 chroot 环境 ---
-          sudo umount "$ROOTFS_DIR/dev/pts" "$ROOTFS_DIR/dev" "$ROOTFS_DIR/proc" "$ROOTFS_DIR/sys" \
-            || sudo umount -l "$ROOTFS_DIR/dev/pts" "$ROOTFS_DIR/dev" "$ROOTFS_DIR/proc" "$ROOTFS_DIR/sys"
+          # 逐个卸载（先子挂载 dev/pts 再父挂载 dev）：
+          #   - 只卸确实挂载着的目标，避免 "not mounted" 噪音（多目标 umount
+          #     的部分失败位掩码（如 96=64+32）会误杀整个步骤）
+          #   - busy 时逐目标 lazy 卸载兜底
+          #   - 最后硬校验：残留挂载会让后续 cp -a 掉进 /proc 等虚拟文件系统
+          for m in dev/pts dev proc sys; do
+            if mountpoint -q "$ROOTFS_DIR/$m"; then
+              sudo umount "$ROOTFS_DIR/$m" || sudo umount -l "$ROOTFS_DIR/$m"
+            fi
+          done
+          for m in dev proc sys; do
+            if mountpoint -q "$ROOTFS_DIR/$m"; then
+              echo "ERROR: $ROOTFS_DIR/$m still mounted after cleanup" >&2
+              exit 1
+            fi
+          done
           sudo rm -f "$ROOTFS_DIR/usr/bin/qemu-aarch64-static"
           echo 'nameserver 1.1.1.1' | sudo tee "$ROOTFS_DIR/etc/resolv.conf" >/dev/null
 
