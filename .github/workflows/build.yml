@@ -236,7 +236,10 @@ jobs:
           cd "$ROM_DIR"
           wget -q --show-progress \
             http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz
-          sudo tar -xzf ArchLinuxARM-aarch64-latest.tar.gz -C "$ROOTFS_DIR"
+          # --warning=no-unknown-keyword：ALARM tarball 由 libarchive 制作，
+          # 其 pax 扩展头（文件 capabilities）GNU tar 不识别，消除警告噪音
+          sudo tar --warning=no-unknown-keyword \
+            -xzf ArchLinuxARM-aarch64-latest.tar.gz -C "$ROOTFS_DIR"
           sudo cp /usr/bin/qemu-aarch64-static "$ROOTFS_DIR/usr/bin/"
           # runner 的 resolv.conf 指向 systemd-resolved 桩(127.0.0.53)，
           # qemu-user chroot 内解析失败（Could not resolve host）→ 写公共 DNS
@@ -246,9 +249,11 @@ jobs:
           printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' \
             | sudo tee "$ROOTFS_DIR/etc/resolv.conf" >/dev/null
 
-          # 注册/确认 binfmt（ubuntu runner 通常已挂载 binfmt_misc）
-          sudo update-binfmts --enable qemu-aarch64 || true
-          sudo chroot "$ROOTFS_DIR" /bin/uname -m   # 必须输出 aarch64
+          # binfmt 说明：ubuntu-24.04 runner 上安装 qemu-user-static 时由
+          # systemd-binfmt 自动注册 binfmt_misc 处理器，无需 update-binfmts
+          # （该命令属 binfmt-support 包，--no-install-recommends 下不存在）。
+          # 此处硬校验 ARM64 二进制确实可执行：
+          test "$(sudo chroot "$ROOTFS_DIR" /bin/uname -m)" = "aarch64"
 
       # ---------------------------------------------------------------------
       # 阶段 2b：chroot 内配置系统 + 安装 denial（官方 aarch64 Pacman 仓）
