@@ -222,7 +222,9 @@ jobs:
           echo "KERNEL_REL=0.0.0-smoketest" >> "$GITHUB_ENV"
           echo "KERNEL_IMG=$PWD/out/arch/arm64/boot/Image.gz" >> "$GITHUB_ENV"
           echo "KERNEL_DTB=$PWD/out/arch/arm64/boot/dts/mediatek/mt6893-xiaomi-chopin.dtb" >> "$GITHUB_ENV"
-          ls -lh "$KERNEL_IMG" "$KERNEL_DTB"
+          # 注意：GITHUB_ENV 对后续步骤生效，本步骤内不能用 $KERNEL_IMG（set -u 会报未绑定）
+          ls -lh out/arch/arm64/boot/Image.gz \
+                 out/arch/arm64/boot/dts/mediatek/mt6893-xiaomi-chopin.dtb
 
       # ---------------------------------------------------------------------
       # 阶段 2a：Arch Linux ARM aarch64 rootfs + QEMU binfmt
