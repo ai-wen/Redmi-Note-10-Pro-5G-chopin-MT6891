@@ -67,7 +67,7 @@ jobs:
       KERNEL_SRC: ${{ github.workspace }}/rom/kernel
       DEFCONFIG: chopin_defconfig
       DTB_PATTERN: "*chopin*.dtb"
-      BUSYBOX_VER: "1.36.1"
+      BUSYBOX_VER: "1.38.0"
       # ---- 构建约定 ----
       MAKE_JOBS: "5" # 1 = 单线程；如内核编译超时可调大
       ROOTFS_SIZE: 6G
@@ -369,6 +369,12 @@ jobs:
           tar -xjf "busybox-${BUSYBOX_VER}.tar.bz2"
           cd "busybox-${BUSYBOX_VER}"
           make defconfig
+          # tc applet 有内核 UAPI 头文件兼容前科（1.36.1 的 CBQ 宏在
+          # linux-libc-dev >= 6.8 中被删除 → networking/tc.c 编译失败）；
+          # initramfs 只需 sh/mount/blkid/mdev/switch_root，tc 无用，直接禁用
+          sed -i 's/^CONFIG_TC=y/# CONFIG_TC is not set/' .config
+          yes '' | make oldconfig >/dev/null
+          grep -q '^# CONFIG_TC is not set' .config
           make CROSS_COMPILE=aarch64-linux-gnu- LDFLAGS="--static" -j"$MAKE_JOBS"
 
           # 校验：aarch64 + 静态链接
