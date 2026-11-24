@@ -36,8 +36,6 @@ name: Linux ROM CI (chopin MT6891, denial desktop)
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main, master]
 
 permissions:
   contents: read
@@ -51,13 +49,13 @@ jobs:
     env:
       # ---- 源码（每次运行全新拉取）----
       KERNEL_REPO: https://github.com/MT6891-Mainline/linux.git
-      KERNEL_REF: '7.3.3-mt6893-xiaomi-chopin'
+      KERNEL_REF: "7.3.3-mt6893-xiaomi-chopin"
       KERNEL_SRC: ${{ github.workspace }}/rom/kernel
       DEFCONFIG: chopin_defconfig
-      DTB_PATTERN: '*chopin*.dtb'
-      BUSYBOX_VER: '1.36.1'
+      DTB_PATTERN: "*chopin*.dtb"
+      BUSYBOX_VER: "1.36.1"
       # ---- 构建约定 ----
-      MAKE_JOBS: '1'        # 1 = 单线程；如内核编译超时可调大
+      MAKE_JOBS: "1" # 1 = 单线程；如内核编译超时可调大
       ROOTFS_SIZE: 6G
       ROM_DIR: ${{ github.workspace }}/rom
       ROOTFS_DIR: ${{ github.workspace }}/rom/rootfs
@@ -74,10 +72,14 @@ jobs:
             git curl wget zip unzip \
             build-essential bc bison flex \
             libssl-dev libelf-dev \
-            python3 python3-pip \
+            python3 \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-            qemu-user-static cpio e2fsprogs xz-utils
-          pip3 install mkbootimg
+            qemu-user-static cpio e2fsprogs xz-utils \
+            mkbootimg
+          # mkbootimg 来自 Ubuntu universe（android-platform-tools 34.0.4）；
+          # PyPI 无此包（pip3 install mkbootimg 会失败），勿改回 pip 安装
+          command -v mkbootimg
+          mkbootimg --help >/dev/null
           df -h /
 
       # ---------------------------------------------------------------------
