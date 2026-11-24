@@ -33,6 +33,11 @@
 #   4. artifact 建议公共仓库运行（免费）；私有仓库注意存储配额。
 #   5. smoke_test 勾选后跳过内核编译与模块安装，用占位内核产物快速验证
 #      rootfs/denial 安装与打包全流程（artifact 带 -SMOKETEST 后缀，不可刷机）。
+#   6. 产物缓存（默认全部复用；勾选 force_rebuild 全部忽略并重编）：
+#      - 内核构建 out/ ：key = defconfig + 内核 commit SHA（换源自动重编）
+#      - 配置好的 rootfs（含 denial）：key = ROOTFS_CACHE_VER + 本 workflow
+#        文件哈希（chroot 脚本一改即自动失效）；想刷新系统包把 VER 手动 +1
+#      - 内核源码缓存仍由 update_cache 单独控制
 # =============================================================================
 
 name: Linux ROM CI (chopin MT6891, denial desktop)
@@ -47,6 +52,11 @@ on:
         default: false
       smoke_test:
         description: '快速验证后续流程：跳过内核编译与模块安装，用占位内核产物走完 rootfs/denial/打包全流程（产物不可刷机）'
+        required: false
+        type: boolean
+        default: false
+      force_rebuild:
+        description: '强制重新编译：忽略内核构建与 rootfs 产物缓存，全部重新执行并保存新缓存'
         required: false
         type: boolean
         default: false
@@ -68,6 +78,8 @@ jobs:
       DEFCONFIG: chopin_defconfig
       DTB_PATTERN: "*chopin*.dtb"
       BUSYBOX_VER: "1.38.0"
+      # rootfs 缓存版本号：chroot 脚本不变但想刷新滚动系统包时手动 +1
+      ROOTFS_CACHE_VER: "1"
       # ---- 构建约定 ----
       MAKE_JOBS: "5" # 1 = 单线程；如内核编译超时可调大
       ROOTFS_SIZE: 6G
@@ -75,6 +87,14 @@ jobs:
       ROOTFS_DIR: ${{ github.workspace }}/rom/rootfs
 
     steps:
+      # ---------------------------------------------------------------------
+      # checkout：仓库极小、秒级完成，仅为 hashFiles 计算 rootfs 缓存键
+      # ---------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       # ---------------------------------------------------------------------
       # 构建机依赖（GCC 交叉工具链 + QEMU 用户态 + 打包工具）
       # ---------------------------------------------------------------------
@@ -180,10 +200,18 @@ jobs:
           key: kernel-src-${{ steps.kernel_src.outputs.sha }}
 
       # ---------------------------------------------------------------------
-      # 阶段 1b：编译内核（GCC 交叉，无 Clang，make -j$MAKE_JOBS）
+      # 阶段 1b：内核构建缓存（key = defconfig + 源码 SHA，命中即免编译）
       # ---------------------------------------------------------------------
+      - name: Restore kernel build cache
+        id: kbuild_cache
+        if: inputs.force_rebuild != true && inputs.smoke_test != true
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.KERNEL_SRC }}/out
+          key: kbuild-${{ env.DEFCONFIG }}-${{ steps.kernel_src.outputs.sha }}
+
       - name: Build kernel
-        if: inputs.smoke_test != true
+        if: inputs.smoke_test != true && (inputs.force_rebuild == true || steps.kbuild_cache.outputs.cache-hit != 'true')
         run: |
           set -euo pipefail
           cd "$KERNEL_SRC"
@@ -207,6 +235,35 @@ jobs:
           echo "KERNEL_DTB=$DTB"       >> "$GITHUB_ENV"
           ls -lh "$IMG" "$DTB"
 
+      - name: Reuse cached kernel build
+        if: inputs.smoke_test != true && inputs.force_rebuild != true && steps.kbuild_cache.outputs.cache-hit == 'true'
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_SRC"
+          KREL="$(cat out/include/config/kernel.release)"
+          IMG=""
+          for cand in Image.gz Image; do
+            [ -f "out/arch/arm64/boot/$cand" ] && IMG="$PWD/out/arch/arm64/boot/$cand" && break
+          done
+          test -n "$IMG" || { echo "cached kernel build incomplete (no image); rerun with force_rebuild" >&2; exit 1; }
+          DTB="$(find out/arch/arm64/boot/dts -name "$DTB_PATTERN" -type f | head -n1)"
+          test -n "$DTB" || { echo "cached kernel build incomplete (no dtb); rerun with force_rebuild" >&2; exit 1; }
+          echo "KERNEL_REL=$KREL" >> "$GITHUB_ENV"
+          echo "KERNEL_IMG=$IMG"  >> "$GITHUB_ENV"
+          echo "KERNEL_DTB=$DTB"  >> "$GITHUB_ENV"
+          echo "reusing cached kernel build: $KREL"
+          ls -lh "$IMG" "$DTB"
+
+      - name: Save kernel build cache
+        if: inputs.smoke_test != true && (inputs.force_rebuild == true || steps.kbuild_cache.outputs.cache-hit != 'true')
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.KERNEL_SRC }}/out
+          key: kbuild-${{ env.DEFCONFIG }}-${{ steps.kernel_src.outputs.sha }}
+        # 同 key 已存在时 save 会报错（缓存不可变）；force_rebuild 同 SHA
+        # 重编场景属预期，吞掉该错误。想替换缓存：源码换 SHA 或删 UI 缓存
+        continue-on-error: true
+
       # ---------------------------------------------------------------------
       # 阶段 1c（smoke test）：占位内核产物，跳过编译仅验证后续流程
       # ---------------------------------------------------------------------
@@ -227,9 +284,20 @@ jobs:
                  out/arch/arm64/boot/dts/mediatek/mt6893-xiaomi-chopin.dtb
 
       # ---------------------------------------------------------------------
-      # 阶段 2a：Arch Linux ARM aarch64 rootfs + QEMU binfmt
+      # 阶段 2a：rootfs 缓存 / Arch Linux ARM aarch64 rootfs + QEMU binfmt
+      # 缓存 key 含 ROOTFS_CACHE_VER 与本 workflow 文件哈希：
+      # chroot 脚本改动自动失效；刷新滚动系统包手动 +1 VER
       # ---------------------------------------------------------------------
+      - name: Restore configured rootfs cache
+        id: rootfs_cache
+        if: inputs.force_rebuild != true
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.ROOTFS_DIR }}
+          key: rootfs-v${{ env.ROOTFS_CACHE_VER }}-${{ hashFiles('.github/workflows/build.yml') }}
+
       - name: Prepare Arch Linux ARM rootfs
+        if: inputs.force_rebuild == true || steps.rootfs_cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           mkdir -p "$ROOTFS_DIR"
@@ -259,6 +327,7 @@ jobs:
       # 阶段 2b：chroot 内配置系统 + 安装 denial（官方 aarch64 Pacman 仓）
       # ---------------------------------------------------------------------
       - name: Configure rootfs and install denial (chroot)
+        if: inputs.force_rebuild == true || steps.rootfs_cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           sudo mount --bind /proc     "$ROOTFS_DIR/proc"
@@ -351,6 +420,15 @@ jobs:
           sudo rm -f "$ROOTFS_DIR/usr/bin/qemu-aarch64-static"
           echo 'nameserver 1.1.1.1' | sudo tee "$ROOTFS_DIR/etc/resolv.conf" >/dev/null
 
+      - name: Save configured rootfs cache
+        if: inputs.force_rebuild == true || steps.rootfs_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.ROOTFS_DIR }}
+          key: rootfs-v${{ env.ROOTFS_CACHE_VER }}-${{ hashFiles('.github/workflows/build.yml') }}
+        # 同 key 已存在时 save 报错（缓存不可变）；刷新系统包请先 VER+1
+        continue-on-error: true
+
       # ---------------------------------------------------------------------
       # 阶段 3：内核模块并入 rootfs（版本必须与内核镜像一致）
       # ---------------------------------------------------------------------
@@ -359,6 +437,9 @@ jobs:
         run: |
           set -euo pipefail
           cd "$KERNEL_SRC"
+          # 清掉缓存 rootfs 里可能残留的旧模块（含 ALARM 通用内核的），
+          # 保证镜像只含本次内核的模块
+          sudo rm -rf "$ROOTFS_DIR/lib/modules"
           # rootfs 由 sudo tar 解出、整树 root 属主，runner 用户无权写入
           # lib/modules → 以 root 执行 modules_install（产物属主 root，
           # 与最终镜像一致；kmod 包提供 depmod）
