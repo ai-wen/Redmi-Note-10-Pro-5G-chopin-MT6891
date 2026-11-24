@@ -1,0 +1,360 @@
+# =============================================================================
+# Linux ROM CI — Redmi Note 10 Pro 5G（chopin / MT6891）· denial 桌面
+#
+# 独立 CI/CD 项目：本仓库只承载 workflow 与文档，所有源码运行时自动拉取。
+#
+# 流程（与仓库根 build.md 对应）：
+#   MT6891 主线内核（7.3.3）经 actions/cache 恢复（未命中才 clone 并保存）
+#   → GCC 交叉编译（无 Clang）
+#   → Arch Linux ARM aarch64 rootfs → 官方 aarch64 仓安装 denial 二进制包
+#   → modules_install → busybox initramfs → mkbootimg 打 boot.img
+#   → ext4 打 linux-rootfs.img → 上传 artifact
+#
+# 常量直接改下方 env 区（无 inputs）：
+#   KERNEL_REPO / KERNEL_REF   内核源码（MT6891-Mainline）。源码走 cache：
+#                              key = 上游分支当前 commit SHA，命中直接复用不再
+#                              clone；上游有新提交自动 miss → 重新拉取并保存。
+#                              缓存只含源码（save 在 clone 后、编译产出 out/ 之前）
+#   MAKE_JOBS                  '1' = 单线程前台编译；超时再调大
+#   ROOTFS_SIZE                rootfs 镜像大小（注意 runner 磁盘余量）
+#   ROOT_PW（脚本内）          rootfs root 密码（SSH 救援用）
+#
+# 注意事项：
+#   1. denial 走官方 aarch64 Pacman 二进制仓（packages.denialwm.org，随
+#      pacman 自动拉取）。源码交叉编译 denial 需自建 ARM64 Flutter/Skia
+#      引擎，远超托管 runner 单 job 6 小时上限，不在 CI 实现。
+#      install.sh 要求交互终端（/dev/tty），此处按其 pacman 通道等价复刻，
+#      签名密钥指纹与 install.sh 一致。
+#   2. mkbootimg 分区参数使用默认值。**首刷前务必按内核移植仓库说明核对
+#      base / kernel_offset / pagesize / header_version，参数错误可能变砖。**
+#      （本内核 CONFIG_CMDLINE_FORCE=y，cmdline 已固化，--cmdline 无需填写）
+#   3. 单线程内核编译约 1–2.5h；单 job 上限 6h（timeout-minutes: 350）。
+#   4. artifact 建议公共仓库运行（免费）；私有仓库注意存储配额。
+# =============================================================================
+
+name: Linux ROM CI (chopin MT6891, denial desktop)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Linux ROM (kernel + denial rootfs + images)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    env:
+      # ---- 源码（每次运行全新拉取）----
+      KERNEL_REPO: https://github.com/MT6891-Mainline/linux.git
+      KERNEL_REF: '7.3.3-mt6893-xiaomi-chopin'
+      KERNEL_SRC: ${{ github.workspace }}/rom/kernel
+      DEFCONFIG: chopin_defconfig
+      DTB_PATTERN: '*chopin*.dtb'
+      BUSYBOX_VER: '1.36.1'
+      # ---- 构建约定 ----
+      MAKE_JOBS: '1'        # 1 = 单线程；如内核编译超时可调大
+      ROOTFS_SIZE: 6G
+      ROM_DIR: ${{ github.workspace }}/rom
+      ROOTFS_DIR: ${{ github.workspace }}/rom/rootfs
+
+    steps:
+      # ---------------------------------------------------------------------
+      # 构建机依赖（GCC 交叉工具链 + QEMU 用户态 + 打包工具）
+      # ---------------------------------------------------------------------
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git curl wget zip unzip \
+            build-essential bc bison flex \
+            libssl-dev libelf-dev \
+            python3 python3-pip \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            qemu-user-static cpio e2fsprogs xz-utils
+          pip3 install mkbootimg
+          df -h /
+
+      # ---------------------------------------------------------------------
+      # 阶段 1a：内核源码缓存（key = 上游分支当前 commit SHA）
+      #   命中 → 直接复用，不 clone；上游有新提交 → miss → 重新 clone 并保存
+      #   缓存只含源码：save 紧跟 clone，先于编译产出 out/
+      # ---------------------------------------------------------------------
+      - name: Resolve upstream kernel commit
+        id: kernel_head
+        run: |
+          set -euo pipefail
+          SHA="$(git ls-remote "$KERNEL_REPO" "refs/heads/$KERNEL_REF" | cut -f1)"
+          test -n "$SHA" || { echo "failed to resolve $KERNEL_REPO @ $KERNEL_REF" >&2; exit 1; }
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "kernel: $KERNEL_REF @ $SHA"
+
+      - name: Restore kernel source from cache
+        id: kernel_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.KERNEL_SRC }}
+          key: kernel-src-${{ steps.kernel_head.outputs.sha }}
+
+      - name: Clone kernel source (on cache miss)
+        if: steps.kernel_cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$ROM_DIR"
+          git clone --depth 1 -b "$KERNEL_REF" "$KERNEL_REPO" "$KERNEL_SRC"
+          git -C "$KERNEL_SRC" log --oneline -1
+
+      - name: Save kernel source to cache
+        if: steps.kernel_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.KERNEL_SRC }}
+          key: kernel-src-${{ steps.kernel_head.outputs.sha }}
+
+      - name: Show kernel source revision
+        run: |
+          set -euo pipefail
+          git -C "$KERNEL_SRC" log --oneline -1
+
+      # ---------------------------------------------------------------------
+      # 阶段 1b：编译内核（GCC 交叉，无 Clang，make -j$MAKE_JOBS）
+      # ---------------------------------------------------------------------
+      - name: Build kernel
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_SRC"
+          make O=out ARCH=arm64 "$DEFCONFIG"
+          make -j"$MAKE_JOBS" O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+
+          KREL="$(cat out/include/config/kernel.release)"
+          echo "Kernel release: $KREL"
+
+          IMG=""
+          for cand in Image.gz Image; do
+            [ -f "out/arch/arm64/boot/$cand" ] && IMG="$PWD/out/arch/arm64/boot/$cand" && break
+          done
+          test -n "$IMG" || { echo "kernel image not found in out/arch/arm64/boot/" >&2; exit 1; }
+
+          DTB="$(find out/arch/arm64/boot/dts -name "$DTB_PATTERN" -type f | head -n1)"
+          test -n "$DTB" || { echo "dtb matching '$DTB_PATTERN' not found" >&2; exit 1; }
+
+          echo "KERNEL_REL=$KREL" >> "$GITHUB_ENV"
+          echo "KERNEL_IMG=$IMG"  >> "$GITHUB_ENV"
+          echo "KERNEL_DTB=$DTB"  >> "$GITHUB_ENV"
+          ls -lh "$IMG" "$DTB"
+
+      # ---------------------------------------------------------------------
+      # 阶段 2a：Arch Linux ARM aarch64 rootfs + QEMU binfmt
+      # ---------------------------------------------------------------------
+      - name: Prepare Arch Linux ARM rootfs
+        run: |
+          set -euo pipefail
+          mkdir -p "$ROOTFS_DIR"
+          cd "$ROM_DIR"
+          wget -q --show-progress \
+            http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz
+          sudo tar -xzf ArchLinuxARM-aarch64-latest.tar.gz -C "$ROOTFS_DIR"
+          sudo cp /usr/bin/qemu-aarch64-static "$ROOTFS_DIR/usr/bin/"
+          sudo cp /etc/resolv.conf "$ROOTFS_DIR/etc/resolv.conf"
+
+          # 注册/确认 binfmt（ubuntu runner 通常已挂载 binfmt_misc）
+          sudo update-binfmts --enable qemu-aarch64 || true
+          sudo chroot "$ROOTFS_DIR" /bin/uname -m   # 必须输出 aarch64
+
+      # ---------------------------------------------------------------------
+      # 阶段 2b：chroot 内配置系统 + 安装 denial（官方 aarch64 Pacman 仓）
+      # ---------------------------------------------------------------------
+      - name: Configure rootfs and install denial (chroot)
+        run: |
+          set -euo pipefail
+          sudo mount --bind /proc     "$ROOTFS_DIR/proc"
+          sudo mount --bind /sys      "$ROOTFS_DIR/sys"
+          sudo mount --bind /dev      "$ROOTFS_DIR/dev"
+          sudo mount --bind /dev/pts  "$ROOTFS_DIR/dev/pts"
+
+          sudo chroot "$ROOTFS_DIR" /bin/bash -s <<'CHROOT_EOF'
+          set -euo pipefail
+          ROOT_PW='chopin'
+
+          # --- 基础系统 ---
+          pacman-key --init
+          pacman-key --populate archlinuxarm
+          pacman -Syu --noconfirm \
+            || { pacman -Sy --noconfirm archlinuxarm-keyring && pacman -Syu --noconfirm; }
+
+          ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+          echo "root:${ROOT_PW}" | chpasswd
+
+          pacman -S --needed --noconfirm \
+            udev networkmanager openssh e2fsprogs sudo curl gnupg greetd
+          systemctl enable NetworkManager sshd || true
+          mkdir -p /etc/ssh/sshd_config.d
+          echo 'PermitRootLogin yes' > /etc/ssh/sshd_config.d/10-root.conf
+
+          echo 'LABEL=linuxroot  /  ext4  defaults,noatime  0 1' >> /etc/fstab
+
+          # --- denial 官方 aarch64 仓库（等价 install.sh 的 pacman 通道）---
+          curl -fLO https://packages.denialwm.org/denial-repo-key.asc
+          pacman-key --add denial-repo-key.asc
+          pacman-key --lsign-key AE4108FA5E91E26BE0EE331E0F5B3AD16E023091
+          rm -f denial-repo-key.asc
+          printf '\n[denial]\nSigLevel = Required TrustedOnly\nServer = https://packages.denialwm.org/arch/$arch\n' \
+            >> /etc/pacman.conf
+          pacman -Syu --noconfirm denial
+
+          # --- 开机自启 denial（greetd initial_session + mobile 外壳）---
+          EXEC_LINE=""
+          DESKTOP=/usr/share/wayland-sessions/denial.desktop
+          if [ -f "$DESKTOP" ]; then
+            EXEC_LINE="$(grep -h -m1 '^Exec=' "$DESKTOP" | cut -d= -f2-)"
+          fi
+          if [ -n "$EXEC_LINE" ]; then
+            cat > /usr/local/bin/denial-mobile-session <<WRAP
+          #!/bin/sh
+          export DENIAL_SHELL_PROFILE=mobile
+          exec ${EXEC_LINE}
+          WRAP
+            chmod +x /usr/local/bin/denial-mobile-session
+            printf '[terminal]\nvt = 7\n\n[default_session]\ncommand = "/usr/local/bin/denial-mobile-session"\nuser = "root"\n' \
+              > /etc/greetd/config.toml
+            systemctl enable greetd || true
+          else
+            echo "WARNING: denial.desktop not found; greetd autostart NOT configured" >&2
+          fi
+          CHROOT_EOF
+
+          # --- 清理 chroot 环境 ---
+          sudo umount "$ROOTFS_DIR/dev/pts" "$ROOTFS_DIR/dev" "$ROOTFS_DIR/proc" "$ROOTFS_DIR/sys" \
+            || sudo umount -l "$ROOTFS_DIR/dev/pts" "$ROOTFS_DIR/dev" "$ROOTFS_DIR/proc" "$ROOTFS_DIR/sys"
+          sudo rm -f "$ROOTFS_DIR/usr/bin/qemu-aarch64-static"
+          echo 'nameserver 1.1.1.1' | sudo tee "$ROOTFS_DIR/etc/resolv.conf" >/dev/null
+
+      # ---------------------------------------------------------------------
+      # 阶段 3：内核模块并入 rootfs（版本必须与内核镜像一致）
+      # ---------------------------------------------------------------------
+      - name: Install kernel modules into rootfs
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_SRC"
+          make -j"$MAKE_JOBS" O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            INSTALL_MOD_PATH="$ROOTFS_DIR" modules_install
+          ls "$ROOTFS_DIR/lib/modules/$KERNEL_REL"
+
+      # ---------------------------------------------------------------------
+      # 阶段 4：busybox initramfs（blkid 找 LABEL=linuxroot 后 switch_root）
+      # ---------------------------------------------------------------------
+      - name: Build busybox and pack initramfs
+        run: |
+          set -euo pipefail
+          cd "$ROM_DIR"
+          wget -q "https://busybox.net/downloads/busybox-${BUSYBOX_VER}.tar.bz2"
+          tar -xjf "busybox-${BUSYBOX_VER}.tar.bz2"
+          cd "busybox-${BUSYBOX_VER}"
+          make defconfig
+          make CROSS_COMPILE=aarch64-linux-gnu- LDFLAGS="--static" -j"$MAKE_JOBS"
+
+          # 校验：aarch64 + 静态链接
+          file busybox
+          file busybox | grep -q 'ARM aarch64'
+          file busybox | grep -q 'statically linked'
+
+          make CONFIG_PREFIX="$ROM_DIR/initramfs" install
+          cd "$ROM_DIR/initramfs"
+          rm -f linuxrc
+          mkdir -p newroot dev proc sys
+
+          cat > init <<'INIT_EOF'
+          #!/bin/sh
+          # cmdline 无 root= 且 CONFIG_CMDLINE_FORCE=y：由 initramfs 定位根分区
+          mkdir -p /proc /sys /dev /newroot
+          mount -t proc     proc     /proc
+          mount -t sysfs    sysfs    /sys
+          mount -t devtmpfs devtmpfs /dev
+          echo /bin/mdev > /proc/sys/kernel/hotplug 2>/dev/null || true
+          mdev -s
+
+          ROOT="$(blkid -L linuxroot)"
+          if [ -z "$ROOT" ]; then
+              echo "[init] LABEL=linuxroot not found; dropping to shell" >&2
+              exec sh
+          fi
+          mount -o ro "$ROOT" /newroot || exec sh
+          exec switch_root /newroot /sbin/init
+          INIT_EOF
+          chmod +x init
+
+          find . | cpio -o -H newc | gzip -1 > "$ROM_DIR/initramfs.cpio.gz"
+          ls -lh "$ROM_DIR/initramfs.cpio.gz"
+
+      # ---------------------------------------------------------------------
+      # 阶段 5a：mkbootimg 打 boot.img（分区参数用默认值，见文件头警告）
+      # ---------------------------------------------------------------------
+      - name: Pack boot.img
+        run: |
+          set -euo pipefail
+          mkbootimg \
+            --kernel "$KERNEL_IMG" \
+            --dtb    "$KERNEL_DTB" \
+            --ramdisk "$ROM_DIR/initramfs.cpio.gz" \
+            --header_version 2 \
+            --output "$ROM_DIR/boot.img"
+          ls -lh "$ROM_DIR/boot.img"
+
+      # ---------------------------------------------------------------------
+      # 阶段 5b：ext4 rootfs 镜像（LABEL=linuxroot，与 fstab/initramfs 对应）
+      # ---------------------------------------------------------------------
+      - name: Pack linux-rootfs.img
+        run: |
+          set -euo pipefail
+          df -h /
+          truncate -s "$ROOTFS_SIZE" "$ROM_DIR/linux-rootfs.img"
+          mkfs.ext4 -F -L linuxroot "$ROM_DIR/linux-rootfs.img"
+
+          sudo mkdir -p /mnt/rootfs
+          sudo mount -o loop "$ROM_DIR/linux-rootfs.img" /mnt/rootfs
+          sudo cp -a "$ROOTFS_DIR/." /mnt/rootfs/
+          sync
+          sudo umount /mnt/rootfs
+          ls -lh "$ROM_DIR/linux-rootfs.img"
+
+      # ---------------------------------------------------------------------
+      - name: Write flash instructions to job summary
+        env:
+          KERNEL_SHA: ${{ steps.kernel_head.outputs.sha }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Linux ROM（chopin / MT6891 · denial 桌面）"
+            echo
+            echo "- Kernel release: \`${KERNEL_REL}\`（MT6891-Mainline \`${KERNEL_REF}\` @ \`${KERNEL_SHA:0:12}\`）"
+            echo "- root 密码（SSH 救援用）: \`chopin\`（workflow 内 ROOT_PW）"
+            echo "- 串口 console 已固化: \`ttyS0,921600\`（earlycon mtk8250）"
+            echo
+            echo "### 刷机"
+            echo '```bash'
+            echo "fastboot flash boot     boot.img"
+            echo "fastboot flash userdata linux-rootfs.img   # 清空安卓数据"
+            echo "fastboot reboot"
+            echo '```'
+            echo
+            echo "> 刷机前先备份原厂 boot/dtbo/vbmeta；mkbootimg 使用默认分区参数，"
+            echo "> 请按内核移植仓库说明核对（build.md §8.1）。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------------
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-rom-chopin-denial
+          path: |
+            ${{ env.ROM_DIR }}/boot.img
+            ${{ env.ROM_DIR }}/initramfs.cpio.gz
+            ${{ env.ROM_DIR }}/linux-rootfs.img
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
