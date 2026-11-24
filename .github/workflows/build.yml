@@ -74,10 +74,24 @@ jobs:
             libssl-dev libelf-dev \
             python3 \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-            qemu-user-static cpio e2fsprogs xz-utils \
-            mkbootimg
-          # mkbootimg 来自 Ubuntu universe（android-platform-tools 34.0.4）；
-          # PyPI 无此包（pip3 install mkbootimg 会失败），勿改回 pip 安装
+            qemu-user-static cpio e2fsprogs xz-utils
+          # mkbootimg 获取（两个来源均不可用的教训）：
+          #   - PyPI 无 mkbootimg 包（pip3 install 报 No matching distribution）
+          #   - Ubuntu universe 的 mkbootimg（android-platform-tools 34.0.4）打包缺失
+          #     gki 模块，运行即 ModuleNotFoundError: No module named 'gki'
+          #   → 改用 AOSP 官方脚本（固定 tag android-14.0.0_r1，内容不可变；
+          #     支持 --header_version 0-4 与 --dtb）。删除其中唯一的非标准库
+          #     import（gki 证书生成，仅服务于 --gki_signing_* GKI 签名，
+          #     本流程不使用该代码路径）
+          curl -fL --retry 3 \
+            "https://android.googlesource.com/platform/system/tools/mkbootimg/+/refs/tags/android-14.0.0_r1/mkbootimg.py?format=TEXT" \
+            | base64 -d > "$RUNNER_TEMP/mkbootimg"
+          sed -i '/^from gki\.generate_gki_certificate import/d' "$RUNNER_TEMP/mkbootimg"
+          if grep -q '^from gki' "$RUNNER_TEMP/mkbootimg"; then
+            echo "ERROR: gki import still present" >&2; exit 1
+          fi
+          head -n1 "$RUNNER_TEMP/mkbootimg"   # 期望: #!/usr/bin/env python3
+          sudo install -m 0755 "$RUNNER_TEMP/mkbootimg" /usr/local/bin/mkbootimg
           command -v mkbootimg
           mkbootimg --help >/dev/null
           df -h /
