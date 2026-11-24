@@ -88,7 +88,7 @@ jobs:
             libssl-dev libelf-dev \
             python3 \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-            qemu-user-static cpio e2fsprogs xz-utils
+            qemu-user-static cpio e2fsprogs xz-utils kmod
           # mkbootimg 获取（两个来源均不可用的教训）：
           #   - PyPI 无 mkbootimg 包（pip3 install 报 No matching distribution）
           #   - Ubuntu universe 的 mkbootimg（android-platform-tools 34.0.4）打包缺失
@@ -359,8 +359,14 @@ jobs:
         run: |
           set -euo pipefail
           cd "$KERNEL_SRC"
-          make -j"$MAKE_JOBS" O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+          # rootfs 由 sudo tar 解出、整树 root 属主，runner 用户无权写入
+          # lib/modules → 以 root 执行 modules_install（产物属主 root，
+          # 与最终镜像一致；kmod 包提供 depmod）
+          sudo make -j"$MAKE_JOBS" O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             INSTALL_MOD_PATH="$ROOTFS_DIR" modules_install
+          # build/source 符号链接指向 runner 源码路径，在设备上是死链，移除
+          sudo rm -f "$ROOTFS_DIR/lib/modules/$KERNEL_REL/build" \
+                    "$ROOTFS_DIR/lib/modules/$KERNEL_REL/source"
           ls "$ROOTFS_DIR/lib/modules/$KERNEL_REL"
 
       # ---------------------------------------------------------------------
