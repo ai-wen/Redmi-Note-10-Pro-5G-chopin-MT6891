@@ -232,6 +232,18 @@ jobs:
           set -euo pipefail
           ROOT_PW='chopin'
 
+          # --- pacman 7.x 下载沙箱与 qemu-user 不兼容 ---
+          # landlock 系统调用在 qemu-user-static 下 ENOSYS，导致：
+          #   restricting filesystem access failed because Landlock is not
+          #   supported by the kernel / switching to sandbox user 'alpm' failed /
+          #   could not determine cachedir mount point（磁盘空间误报同源）
+          # 官方对策：pacman.conf 启用 DisableSandbox（man pacman.conf(5)）；
+          # 同款修复见 termux/proot-distro 的 archlinux 构建脚本
+          sed -i 's/^#DisableSandbox/DisableSandbox/' /etc/pacman.conf
+          grep -q '^DisableSandbox' /etc/pacman.conf \
+            || sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf
+          sed -i 's/^DownloadUser/#DownloadUser/' /etc/pacman.conf
+
           # --- 基础系统 ---
           pacman-key --init
           pacman-key --populate archlinuxarm
