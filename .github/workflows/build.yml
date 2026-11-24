@@ -39,7 +39,7 @@ on:
   workflow_dispatch:
     inputs:
       update_cache:
-        description: '更新内核源码缓存：检查上游新提交并重新拉取保存。默认关闭，直接复用现有缓存（无缓存时首次运行仍会拉取并缓存）'
+        description: "更新内核源码缓存：检查上游新提交并重新拉取保存。默认关闭，直接复用现有缓存（无缓存时首次运行仍会拉取并缓存）"
         required: false
         type: boolean
         default: false
@@ -62,7 +62,7 @@ jobs:
       DTB_PATTERN: "*chopin*.dtb"
       BUSYBOX_VER: "1.36.1"
       # ---- 构建约定 ----
-      MAKE_JOBS: "1" # 1 = 单线程；如内核编译超时可调大
+      MAKE_JOBS: "5" # 1 = 单线程；如内核编译超时可调大
       ROOTFS_SIZE: 6G
       ROM_DIR: ${{ github.workspace }}/rom
       ROOTFS_DIR: ${{ github.workspace }}/rom/rootfs
