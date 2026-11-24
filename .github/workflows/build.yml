@@ -12,8 +12,9 @@
 #
 # 常量直接改下方 env 区（无 inputs）：
 #   KERNEL_REPO / KERNEL_REF   内核源码（MT6891-Mainline）。源码走 cache：
-#                              key = 上游分支当前 commit SHA，命中直接复用不再
-#                              clone；上游有新提交自动 miss → 重新拉取并保存。
+#                              默认复用最近一次保存的缓存（不查上游）；
+#                              手动触发勾选 update_cache 才检查上游新提交并
+#                              重新拉取保存（缓存 key = 该 commit SHA）。
 #                              缓存只含源码（save 在 clone 后、编译产出 out/ 之前）
 #   MAKE_JOBS                  '1' = 单线程前台编译；超时再调大
 #   ROOTFS_SIZE                rootfs 镜像大小（注意 runner 磁盘余量）
@@ -36,6 +37,12 @@ name: Linux ROM CI (chopin MT6891, denial desktop)
 
 on:
   workflow_dispatch:
+    inputs:
+      update_cache:
+        description: '更新内核源码缓存：检查上游新提交并重新拉取保存。默认关闭，直接复用现有缓存（无缓存时首次运行仍会拉取并缓存）'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -97,45 +104,73 @@ jobs:
           df -h /
 
       # ---------------------------------------------------------------------
-      # 阶段 1a：内核源码缓存（key = 上游分支当前 commit SHA）
-      #   命中 → 直接复用，不 clone；上游有新提交 → miss → 重新 clone 并保存
+      # 阶段 1a：内核源码缓存
+      #   默认（update_cache=false）：复用最近一次保存的缓存，不查上游
+      #   勾选 update_cache：查上游分支 HEAD，SHA 未缓存则重新 clone 并保存
       #   缓存只含源码：save 紧跟 clone，先于编译产出 out/
       # ---------------------------------------------------------------------
-      - name: Resolve upstream kernel commit
+      - name: Resolve upstream kernel commit (update mode only)
+        if: inputs.update_cache == true
         id: kernel_head
         run: |
           set -euo pipefail
           SHA="$(git ls-remote "$KERNEL_REPO" "refs/heads/$KERNEL_REF" | cut -f1)"
           test -n "$SHA" || { echo "failed to resolve $KERNEL_REPO @ $KERNEL_REF" >&2; exit 1; }
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "kernel: $KERNEL_REF @ $SHA"
+          echo "kernel upstream: $KERNEL_REF @ $SHA"
 
       - name: Restore kernel source from cache
         id: kernel_cache
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.KERNEL_SRC }}
+          # update 模式：主键 = 上游 SHA，精确命中直接复用；
+          # 默认模式：kernel_head 未运行，主键为 kernel-src-（恒不命中），
+          #           由 restore-keys 前缀取最近一次保存的 kernel-src-<SHA>
           key: kernel-src-${{ steps.kernel_head.outputs.sha }}
+          restore-keys: |
+            kernel-src-
 
-      - name: Clone kernel source (on cache miss)
-        if: steps.kernel_cache.outputs.cache-hit != 'true'
+      - name: Prepare kernel source (reuse cache or clone)
+        id: kernel_src
+        env:
+          UPDATE: ${{ inputs.update_cache }}
+          CACHE_HIT: ${{ steps.kernel_cache.outputs.cache-hit }}
         run: |
           set -euo pipefail
-          mkdir -p "$ROM_DIR"
-          git clone --depth 1 -b "$KERNEL_REF" "$KERNEL_REPO" "$KERNEL_SRC"
+          [ "$UPDATE" = "true" ] || UPDATE=false
+
+          ACTION=reuse
+          if [ "$UPDATE" = "true" ]; then
+            if [ "$CACHE_HIT" != "true" ]; then
+              echo "update 模式：上游有新提交（或该 SHA 未缓存），重新 clone"
+              ACTION=clone
+            fi
+          else
+            if [ ! -d "$KERNEL_SRC/.git" ]; then
+              echo "默认模式：无可用缓存（首次运行），clone 并入缓存"
+              ACTION=clone
+            fi
+          fi
+
+          if [ "$ACTION" = "clone" ]; then
+            rm -rf "$KERNEL_SRC"     # 清掉 restore 取回的旧版本（如有）
+            mkdir -p "$ROM_DIR"
+            git clone --depth 1 -b "$KERNEL_REF" "$KERNEL_REPO" "$KERNEL_SRC"
+            echo "cloned=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          SHA_NOW="$(git -C "$KERNEL_SRC" rev-parse HEAD)"
+          echo "sha=$SHA_NOW" >> "$GITHUB_OUTPUT"
+          echo "kernel build tree: $KERNEL_REF @ $SHA_NOW"
           git -C "$KERNEL_SRC" log --oneline -1
 
-      - name: Save kernel source to cache
-        if: steps.kernel_cache.outputs.cache-hit != 'true'
+      - name: Save kernel source to cache (only after fresh clone)
+        if: steps.kernel_src.outputs.cloned == 'true'
         uses: actions/cache/save@v4
         with:
           path: ${{ env.KERNEL_SRC }}
-          key: kernel-src-${{ steps.kernel_head.outputs.sha }}
-
-      - name: Show kernel source revision
-        run: |
-          set -euo pipefail
-          git -C "$KERNEL_SRC" log --oneline -1
+          key: kernel-src-${{ steps.kernel_src.outputs.sha }}
 
       # ---------------------------------------------------------------------
       # 阶段 1b：编译内核（GCC 交叉，无 Clang，make -j$MAKE_JOBS）
@@ -341,7 +376,7 @@ jobs:
       # ---------------------------------------------------------------------
       - name: Write flash instructions to job summary
         env:
-          KERNEL_SHA: ${{ steps.kernel_head.outputs.sha }}
+          KERNEL_SHA: ${{ steps.kernel_src.outputs.sha }}
         run: |
           set -euo pipefail
           {
