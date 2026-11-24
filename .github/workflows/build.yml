@@ -373,7 +373,11 @@ jobs:
           # linux-libc-dev >= 6.8 中被删除 → networking/tc.c 编译失败）；
           # initramfs 只需 sh/mount/blkid/mdev/switch_root，tc 无用，直接禁用
           sed -i 's/^CONFIG_TC=y/# CONFIG_TC is not set/' .config
+          # oldconfig 需交互应答，用 yes 灌回车；make 结束后 yes 必收
+          # SIGPIPE(141)，而 pipefail 会将其判为整条管道失败 → 此处临时关闭
+          set +o pipefail
           yes '' | make oldconfig >/dev/null
+          set -o pipefail
           grep -q '^# CONFIG_TC is not set' .config
           make CROSS_COMPILE=aarch64-linux-gnu- LDFLAGS="--static" -j"$MAKE_JOBS"
 
