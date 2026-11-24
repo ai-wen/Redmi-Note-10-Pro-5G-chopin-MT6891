@@ -31,6 +31,8 @@
 #      （本内核 CONFIG_CMDLINE_FORCE=y，cmdline 已固化，--cmdline 无需填写）
 #   3. 单线程内核编译约 1–2.5h；单 job 上限 6h（timeout-minutes: 350）。
 #   4. artifact 建议公共仓库运行（免费）；私有仓库注意存储配额。
+#   5. smoke_test 勾选后跳过内核编译与模块安装，用占位内核产物快速验证
+#      rootfs/denial 安装与打包全流程（artifact 带 -SMOKETEST 后缀，不可刷机）。
 # =============================================================================
 
 name: Linux ROM CI (chopin MT6891, denial desktop)
@@ -39,7 +41,12 @@ on:
   workflow_dispatch:
     inputs:
       update_cache:
-        description: "更新内核源码缓存：检查上游新提交并重新拉取保存。默认关闭，直接复用现有缓存（无缓存时首次运行仍会拉取并缓存）"
+        description: '更新内核源码缓存：检查上游新提交并重新拉取保存。默认关闭，直接复用现有缓存（无缓存时首次运行仍会拉取并缓存）'
+        required: false
+        type: boolean
+        default: false
+      smoke_test:
+        description: '快速验证后续流程：跳过内核编译与模块安装，用占位内核产物走完 rootfs/denial/打包全流程（产物不可刷机）'
         required: false
         type: boolean
         default: false
@@ -176,6 +183,7 @@ jobs:
       # 阶段 1b：编译内核（GCC 交叉，无 Clang，make -j$MAKE_JOBS）
       # ---------------------------------------------------------------------
       - name: Build kernel
+        if: inputs.smoke_test != true
         run: |
           set -euo pipefail
           cd "$KERNEL_SRC"
@@ -194,10 +202,27 @@ jobs:
           DTB="$(find out/arch/arm64/boot/dts -name "$DTB_PATTERN" -type f | head -n1)"
           test -n "$DTB" || { echo "dtb matching '$DTB_PATTERN' not found" >&2; exit 1; }
 
-          echo "KERNEL_REL=$KREL" >> "$GITHUB_ENV"
-          echo "KERNEL_IMG=$IMG"  >> "$GITHUB_ENV"
-          echo "KERNEL_DTB=$DTB"  >> "$GITHUB_ENV"
+          echo "KERNEL_REL=$KREL"      >> "$GITHUB_ENV"
+          echo "KERNEL_IMG=$IMG"       >> "$GITHUB_ENV"
+          echo "KERNEL_DTB=$DTB"       >> "$GITHUB_ENV"
           ls -lh "$IMG" "$DTB"
+
+      # ---------------------------------------------------------------------
+      # 阶段 1c（smoke test）：占位内核产物，跳过编译仅验证后续流程
+      # ---------------------------------------------------------------------
+      - name: Fabricate placeholder kernel artifacts (smoke test)
+        if: inputs.smoke_test == true
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_SRC"
+          mkdir -p out/arch/arm64/boot/dts/mediatek out/include/config
+          head -c 8192 /dev/urandom | gzip -1 > out/arch/arm64/boot/Image.gz
+          head -c 2048  /dev/urandom > out/arch/arm64/boot/dts/mediatek/mt6893-xiaomi-chopin.dtb
+          printf '0.0.0-smoketest\n' > out/include/config/kernel.release
+          echo "KERNEL_REL=0.0.0-smoketest" >> "$GITHUB_ENV"
+          echo "KERNEL_IMG=$PWD/out/arch/arm64/boot/Image.gz" >> "$GITHUB_ENV"
+          echo "KERNEL_DTB=$PWD/out/arch/arm64/boot/dts/mediatek/mt6893-xiaomi-chopin.dtb" >> "$GITHUB_ENV"
+          ls -lh "$KERNEL_IMG" "$KERNEL_DTB"
 
       # ---------------------------------------------------------------------
       # 阶段 2a：Arch Linux ARM aarch64 rootfs + QEMU binfmt
@@ -211,7 +236,13 @@ jobs:
             http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz
           sudo tar -xzf ArchLinuxARM-aarch64-latest.tar.gz -C "$ROOTFS_DIR"
           sudo cp /usr/bin/qemu-aarch64-static "$ROOTFS_DIR/usr/bin/"
-          sudo cp /etc/resolv.conf "$ROOTFS_DIR/etc/resolv.conf"
+          # runner 的 resolv.conf 指向 systemd-resolved 桩(127.0.0.53)，
+          # qemu-user chroot 内解析失败（Could not resolve host）→ 写公共 DNS
+          # （proot-distro 的 archlinux 构建同款做法；镜像内残留由
+          #   chroot 后清理步骤统一改回 1.1.1.1）
+          sudo rm -f "$ROOTFS_DIR/etc/resolv.conf"
+          printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' \
+            | sudo tee "$ROOTFS_DIR/etc/resolv.conf" >/dev/null
 
           # 注册/确认 binfmt（ubuntu runner 通常已挂载 binfmt_misc）
           sudo update-binfmts --enable qemu-aarch64 || true
@@ -232,17 +263,19 @@ jobs:
           set -euo pipefail
           ROOT_PW='chopin'
 
-          # --- pacman 7.x 下载沙箱与 qemu-user 不兼容 ---
-          # landlock 系统调用在 qemu-user-static 下 ENOSYS，导致：
-          #   restricting filesystem access failed because Landlock is not
-          #   supported by the kernel / switching to sandbox user 'alpm' failed /
-          #   could not determine cachedir mount point（磁盘空间误报同源）
-          # 官方对策：pacman.conf 启用 DisableSandbox（man pacman.conf(5)）；
-          # 同款修复见 termux/proot-distro 的 archlinux 构建脚本
+          # --- qemu-user 下 pacman 的两处不兼容 ---
+          # 1) pacman 7.x 下载沙箱（landlock + alpm 用户）在 qemu-user 下不可用：
+          #    官方对策 DisableSandbox（man pacman.conf(5)；proot-distro 的
+          #    archlinux 构建脚本同款修复）
+          # 2) CheckSpace 磁盘空间检查需把 cachedir 的 st_dev 与
+          #    /proc/self/mounts 匹配出挂载点，qemu-user 的 statvfs 值对不上 →
+          #    "could not determine cachedir mount point" +
+          #    "not enough free disk space" 误报；runner 磁盘充足，直接关闭
           sed -i 's/^#DisableSandbox/DisableSandbox/' /etc/pacman.conf
           grep -q '^DisableSandbox' /etc/pacman.conf \
             || sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf
           sed -i 's/^DownloadUser/#DownloadUser/' /etc/pacman.conf
+          sed -i 's/^CheckSpace/#CheckSpace/' /etc/pacman.conf
 
           # --- 基础系统 ---
           pacman-key --init
@@ -301,6 +334,7 @@ jobs:
       # 阶段 3：内核模块并入 rootfs（版本必须与内核镜像一致）
       # ---------------------------------------------------------------------
       - name: Install kernel modules into rootfs
+        if: inputs.smoke_test != true
         run: |
           set -euo pipefail
           cd "$KERNEL_SRC"
@@ -389,9 +423,15 @@ jobs:
       - name: Write flash instructions to job summary
         env:
           KERNEL_SHA: ${{ steps.kernel_src.outputs.sha }}
+          SMOKE: ${{ inputs.smoke_test }}
         run: |
           set -euo pipefail
           {
+            if [ "$SMOKE" = "true" ]; then
+              echo "## WARNING: SMOKE TEST 运行"
+              echo "**内核为占位随机数据，本产物不可刷机**（仅用于验证 rootfs/denial/打包流程）"
+              echo
+            fi
             echo "## Linux ROM（chopin / MT6891 · denial 桌面）"
             echo
             echo "- Kernel release: \`${KERNEL_REL}\`（MT6891-Mainline \`${KERNEL_REF}\` @ \`${KERNEL_SHA:0:12}\`）"
@@ -413,7 +453,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: linux-rom-chopin-denial
+          name: linux-rom-chopin-denial${{ inputs.smoke_test == true && '-SMOKETEST' || '' }}
           path: |
             ${{ env.ROM_DIR }}/boot.img
             ${{ env.ROM_DIR }}/initramfs.cpio.gz
