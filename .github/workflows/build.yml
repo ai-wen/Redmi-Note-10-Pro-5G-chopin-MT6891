@@ -26,8 +26,8 @@
 #      引擎，远超托管 runner 单 job 6 小时上限，不在 CI 实现。
 #      install.sh 要求交互终端（/dev/tty），此处按其 pacman 通道等价复刻，
 #      签名密钥指纹与 install.sh 一致。
-#   2. mkbootimg 分区参数使用默认值。**首刷前务必按内核移植仓库说明核对
-#      base / kernel_offset / pagesize / header_version，参数错误可能变砖。**
+#   2. mkbootimg 分区参数已按原厂 boot.img 头部实测固化（base=0x40078000
+#      等，见 Pack boot.img 步骤注释），无需再核对。
 #      （本内核 CONFIG_CMDLINE_FORCE=y，cmdline 已固化，--cmdline 无需填写）
 #   3. 单线程内核编译约 1–2.5h；单 job 上限 6h（timeout-minutes: 350）。
 #   4. artifact 建议公共仓库运行（免费）；私有仓库注意存储配额。
@@ -573,10 +573,20 @@ jobs:
       - name: Pack boot.img
         run: |
           set -euo pipefail
+          # 分区参数实测自原厂线刷包 boot.img 头部（chopin_images_V13.0.3.1.15，
+          # header v2）：kernel_addr=0x40080000 ramdisk_addr=0x51100000
+          # tags_addr=dtb_addr=0x47c80000 pagesize=2048；base=0x40078000。
+          # 用 mkbootimg 默认 base(0x10000000) 会导致 LK 跳错地址 → 黑屏循环
           mkbootimg \
             --kernel "$KERNEL_IMG" \
             --dtb    "$KERNEL_DTB" \
             --ramdisk "$ROM_DIR/initramfs.cpio.gz" \
+            --base 0x40078000 \
+            --kernel_offset 0x00008000 \
+            --ramdisk_offset 0x11088000 \
+            --tags_offset 0x7C08000 \
+            --dtb_offset 0x7C08000 \
+            --pagesize 2048 \
             --header_version 2 \
             --output "$ROM_DIR/boot.img"
           ls -lh "$ROM_DIR/boot.img"
