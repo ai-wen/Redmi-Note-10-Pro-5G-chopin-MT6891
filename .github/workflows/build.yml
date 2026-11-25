@@ -357,12 +357,14 @@ jobs:
           sed -i 's/^DownloadUser/#DownloadUser/' /etc/pacman.conf
           sed -i 's/^CheckSpace/#CheckSpace/' /etc/pacman.conf
 
-          # 官方 GeoIP 主镜像偶发 DB 与包池短暂不同步（push 同步中途 → 404）：
-          # 配置多镜像回退，pacman 单文件拉取失败会自动换下一个 server
+          # 多镜像回退（2026-11 实测可用；us/eu 等子域不存在，勿臆造）：
+          # GeoIP 主镜像存在 DB 与包池不同步/后端不完整的个案（mesa 404），
+          # pacman 单文件拉取失败会自动换下一个 server
           cat > /etc/pacman.d/mirrorlist <<'MIRRORS'
           Server = http://mirror.archlinuxarm.org/$arch/$repo
-          Server = http://eu.mirror.archlinuxarm.org/$arch/$repo
-          Server = http://us.mirror.archlinuxarm.org/$arch/$repo
+          Server = http://de.mirror.archlinuxarm.org/$arch/$repo
+          Server = http://mirror.csclub.uwaterloo.ca/archlinuxarm/$arch/$repo
+          Server = http://mirrors.dotsrc.org/archlinuxarm/$arch/$repo
           MIRRORS
 
           # --- 基础系统 ---
@@ -377,10 +379,16 @@ jobs:
           # mesa + vulkan-panfrost：chopin 的 GPU 是 Mali G77，panfrost 是
           # 对应主线驱动。预装可满足 vulkan-driver 虚拟依赖，否则安装 denial
           # 时会弹 13 选 1 的 provider 提示，--noconfirm 默认选 nvidia-utils
-          # （对 ARM 手机完全无意义还多占 ~300MB）
-          pacman -S --needed --noconfirm \
-            udev networkmanager openssh e2fsprogs sudo curl gnupg greetd \
-            mesa vulkan-panfrost
+          # （对 ARM 手机完全无意义还多占 ~300MB）。带重试防镜像瞬态 404
+          ok=0
+          for attempt in 1 2 3; do
+            if pacman -S --needed --noconfirm \
+                 udev networkmanager openssh e2fsprogs sudo curl gnupg greetd \
+                 mesa vulkan-panfrost; then ok=1; break; fi
+            echo "base install attempt $attempt failed; retry in 60s" >&2
+            sleep 60
+          done
+          [ "$ok" = 1 ] || { echo "base install failed after 3 attempts" >&2; exit 1; }
           systemctl enable NetworkManager sshd || true
           mkdir -p /etc/ssh/sshd_config.d
           echo 'PermitRootLogin yes' > /etc/ssh/sshd_config.d/10-root.conf
