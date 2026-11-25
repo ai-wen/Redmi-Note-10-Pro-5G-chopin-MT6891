@@ -339,6 +339,38 @@ jobs:
           sudo mount --bind /dev      "$ROOTFS_DIR/dev"
           sudo mount --bind /dev/pts  "$ROOTFS_DIR/dev/pts"
 
+          # ---- 镜像健康检查（host 侧执行；rootfs 里此时未必有 curl）----
+          # 背景：GeoIP 主镜像把不同客户端定向到状态不一的后端，DB 引用的
+          # 包版本可能不在包池（实测 DB=-2/池=-3 → 404，且随时间漂移）。
+          # 逐镜像校验"其 extra.db 引用的 mesa 版本在自己包池确实存在"，
+          # 只把一致者写入 mirrorlist；全不一致则退回全列表（不比现状差）。
+          CANDIDATES="
+            http://mirror.archlinuxarm.org
+            http://de.mirror.archlinuxarm.org
+            http://mirror.csclub.uwaterloo.ca/archlinuxarm
+            http://mirrors.dotsrc.org/archlinuxarm"
+          HEALTHY=""
+          for base in $CANDIDATES; do
+            fn="$(curl -fsSL --max-time 90 "$base/aarch64/extra/extra.db" -o /tmp/extra.db \
+                  && tar -xaf /tmp/extra.db -O 'mesa-*/desc' 2>/dev/null \
+                  | awk '/^%FILENAME%$/{getline; print; exit}' || true)"
+            if [ -n "$fn" ] && curl -fsI --max-time 30 "$base/aarch64/extra/$fn" -o /dev/null; then
+              HEALTHY="$HEALTHY $base"
+              echo "mirror OK:  $base (mesa $fn)"
+            else
+              echo "mirror BAD: $base (db file: ${fn:-none})" >&2
+            fi
+          done
+          if [ -z "$HEALTHY" ]; then
+            echo "WARNING: no self-consistent mirror found; using full list" >&2
+            HEALTHY="$CANDIDATES"
+          fi
+          sudo rm -f "$ROOTFS_DIR/etc/pacman.d/mirrorlist"
+          for b in $HEALTHY; do
+            echo "Server = $b/\$arch/\$repo" | sudo tee -a "$ROOTFS_DIR/etc/pacman.d/mirrorlist" >/dev/null
+          done
+          cat "$ROOTFS_DIR/etc/pacman.d/mirrorlist"
+
           sudo chroot "$ROOTFS_DIR" /bin/bash -s <<'CHROOT_EOF'
           set -euo pipefail
           ROOT_PW='chopin'
@@ -357,15 +389,8 @@ jobs:
           sed -i 's/^DownloadUser/#DownloadUser/' /etc/pacman.conf
           sed -i 's/^CheckSpace/#CheckSpace/' /etc/pacman.conf
 
-          # 多镜像回退（2026-11 实测可用；us/eu 等子域不存在，勿臆造）：
-          # GeoIP 主镜像存在 DB 与包池不同步/后端不完整的个案（mesa 404），
-          # pacman 单文件拉取失败会自动换下一个 server
-          cat > /etc/pacman.d/mirrorlist <<'MIRRORS'
-          Server = http://mirror.archlinuxarm.org/$arch/$repo
-          Server = http://de.mirror.archlinuxarm.org/$arch/$repo
-          Server = http://mirror.csclub.uwaterloo.ca/archlinuxarm/$arch/$repo
-          Server = http://mirrors.dotsrc.org/archlinuxarm/$arch/$repo
-          MIRRORS
+          # mirrorlist 已在 chroot 前由 host 侧健康检查动态生成
+          # （筛选 DB 与包池一致的镜像，见上方 "镜像健康检查" 段落）
 
           # --- 基础系统 ---
           pacman-key --init
