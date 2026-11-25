@@ -227,8 +227,11 @@ jobs:
           done
           test -n "$IMG" || { echo "kernel image not found in out/arch/arm64/boot/" >&2; exit 1; }
 
-          DTB="$(find out/arch/arm64/boot/dts -name "$DTB_PATTERN" -type f | head -n1)"
+          # find 搜索根必须用绝对路径：相对根返回相对路径，后续步骤
+          # （CWD 是 workspace 而非内核目录）会解析失败
+          DTB="$(find "$PWD/out/arch/arm64/boot/dts" -name "$DTB_PATTERN" -type f | head -n1)"
           test -n "$DTB" || { echo "dtb matching '$DTB_PATTERN' not found" >&2; exit 1; }
+          case "$DTB" in /*) ;; *) echo "dtb path not absolute: $DTB" >&2; exit 1;; esac
 
           echo "KERNEL_REL=$KREL"      >> "$GITHUB_ENV"
           echo "KERNEL_IMG=$IMG"       >> "$GITHUB_ENV"
@@ -246,8 +249,9 @@ jobs:
             [ -f "out/arch/arm64/boot/$cand" ] && IMG="$PWD/out/arch/arm64/boot/$cand" && break
           done
           test -n "$IMG" || { echo "cached kernel build incomplete (no image); rerun with force_rebuild" >&2; exit 1; }
-          DTB="$(find out/arch/arm64/boot/dts -name "$DTB_PATTERN" -type f | head -n1)"
+          DTB="$(find "$PWD/out/arch/arm64/boot/dts" -name "$DTB_PATTERN" -type f | head -n1)"
           test -n "$DTB" || { echo "cached kernel build incomplete (no dtb); rerun with force_rebuild" >&2; exit 1; }
+          case "$DTB" in /*) ;; *) echo "dtb path not absolute: $DTB" >&2; exit 1;; esac
           echo "KERNEL_REL=$KREL" >> "$GITHUB_ENV"
           echo "KERNEL_IMG=$IMG"  >> "$GITHUB_ENV"
           echo "KERNEL_DTB=$DTB"  >> "$GITHUB_ENV"
