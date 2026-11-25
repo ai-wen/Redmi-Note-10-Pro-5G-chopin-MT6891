@@ -573,13 +573,20 @@ jobs:
       - name: Pack boot.img
         run: |
           set -euo pipefail
-          # 分区参数实测自原厂线刷包 boot.img 头部（chopin_images_V13.0.3.1.15，
+          # 参数实测自原厂线刷包 boot.img 头部（chopin_images_V13.0.3.1.15，
           # header v2）：kernel_addr=0x40080000 ramdisk_addr=0x51100000
           # tags_addr=dtb_addr=0x47c80000 pagesize=2048；base=0x40078000。
-          # 用 mkbootimg 默认 base(0x10000000) 会导致 LK 跳错地址 → 黑屏循环
+          # 用默认 base(0x10000000) 会导致 LK 跳错地址 → 黑屏循环
+          #
+          # --dtb 必须用原厂 dt-table（blobs/chopin-stock-dtb.bin，201848
+          # 字节，从原厂 boot.img dtb 字段逐字节提取）：chopin 的 LK 会把
+          # dtbo 分区 overlay 叠加到这个 dtb 上，而主线精简 dtb 缺少 overlay
+          # 所需的 __symbols__ 符号 → ufdt_overlay fixup 失败 → LK 拒绝启动
+          # 内核（黑屏循环）。主线设备树已内嵌进内核镜像（setup.c 的
+          # CHOPIN-DTB 机制），启动早期会自行覆盖 LK 传入的树，无需随包。
           mkbootimg \
             --kernel "$KERNEL_IMG" \
-            --dtb    "$KERNEL_DTB" \
+            --dtb    "$GITHUB_WORKSPACE/blobs/chopin-stock-dtb.bin" \
             --ramdisk "$ROM_DIR/initramfs.cpio.gz" \
             --base 0x40078000 \
             --kernel_offset 0x00008000 \
