@@ -401,6 +401,10 @@ jobs:
           ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
           echo "root:${ROOT_PW}" | chpasswd
 
+          # 普通桌面用户 kk（wheel=sudo；audio/video/input/render=声卡/DRM/输入）
+          useradd -m -G wheel,audio,video,input,render kk
+          echo 'kk:chopin' | chpasswd
+
           # mesa + vulkan-panfrost：chopin 的 GPU 是 Mali G77，panfrost 是
           # 对应主线驱动。预装可满足 vulkan-driver 虚拟依赖，否则安装 denial
           # 时会弹 13 选 1 的 provider 提示，--noconfirm 默认选 nvidia-utils
@@ -449,7 +453,7 @@ jobs:
           exec ${EXEC_LINE}
           WRAP
             chmod +x /usr/local/bin/denial-mobile-session
-            printf '[terminal]\nvt = 7\n\n[default_session]\ncommand = "/usr/local/bin/denial-mobile-session"\nuser = "root"\n' \
+            printf '[terminal]\nvt = 7\n\n[default_session]\ncommand = "/usr/local/bin/denial-mobile-session"\nuser = "kk"\n' \
               > /etc/greetd/config.toml
             systemctl enable greetd || true
           else
@@ -610,6 +614,7 @@ jobs:
             echo "## Linux ROM（chopin / MT6891 · denial 桌面）"
             echo
             echo "- Kernel release: \`${KERNEL_REL}\`（MT6891-Mainline \`${KERNEL_REF}\` @ \`${KERNEL_SHA:0:12}\`）"
+            echo "- 桌面用户: \`kk\` / \`chopin\`（greetd 自动登录进 denial，非 root 运行）"
             echo "- root 密码（SSH 救援用）: \`chopin\`（workflow 内 ROOT_PW）"
             echo "- 串口 console 已固化: \`ttyS0,921600\`（earlycon mtk8250）"
             echo
